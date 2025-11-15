@@ -35,11 +35,20 @@ def _d2f_extract_into_tensor(self, a: torch.Tensor, t: torch.Tensor, x_shape: tu
 def _d2f_convert_fm_t_to_dm_t(self, t: torch.Tensor) -> torch.Tensor:
     rectified_alphas_cumprod_full = self.df_rectified_alphas_cumprod_full.clone().to(t.device)
     rectified_alphas_cumprod_full = torch.flip(rectified_alphas_cumprod_full, [0])
-    right_index = torch.searchsorted(rectified_alphas_cumprod_full, t, right=True)
-    left_index = right_index - 1
+    max_idx = rectified_alphas_cumprod_full.shape[0] - 1
+    
+    # Find the indices for interpolation, and clamp them to be within the valid range.
+    right_index = torch.searchsorted(rectified_alphas_cumprod_full, t, right=True).clamp(max=max_idx)
+    left_index = (right_index - 1).clamp(min=0)
+
     right_value = rectified_alphas_cumprod_full[right_index]
     left_value = rectified_alphas_cumprod_full[left_index]
-    dm_t = left_index.float() + (t - left_value) / (right_value - left_value)
+    
+    # Prevent division by zero if left and right values are the same.
+    denom = right_value - left_value
+    interp_ratio = torch.where(denom > 0, (t - left_value) / denom, torch.zeros_like(t))
+
+    dm_t = left_index.float() + interp_ratio
     dm_t = self.model_sampling.num_timesteps - dm_t
     return dm_t
 
@@ -213,37 +222,69 @@ class ODEFunction:
         self.is_adaptive = is_adaptive
         self.step = 0
         self.last_denoised = None
+        self.is_diff2flow = hasattr(self.model.inner_model, 'get_diff2flow_velocity')
         if is_adaptive: self.pbar = tqdm(total=100, desc="solve", unit="%", leave=False, position=1)
         else: self.pbar = tqdm(total=n_steps, desc="solve", leave=False, position=1)
 
     def __call__(self, t, y):
-        if t <= 1e-5: 
-            return torch.zeros_like(y)
-
         # Add batch dimension for the model
         y_in = y.unsqueeze(0)
-        
+
         # prepare timestep for the model
         timestep_in = t.unsqueeze(0) if t.ndim == 0 else t
 
-        # Call the CFGGuider
-        denoised = self.model(y_in, timestep_in, **self.extra_args)
+        if self.is_diff2flow:
+            base_model = self.model.inner_model
+            cond_scale = self.model.cfg
+            positive_conds = self.model.conds.get("positive")
+            negative_conds = self.model.conds.get("negative")
+            model_options = self.extra_args.get('model_options', {})
 
-        self.last_denoised = denoised
-        # Calculate derivative
-        derivative = (y_in - denoised) / t
+            original_apply_model = base_model.apply_model
+            try:
+                t_in = timestep_in.repeat(y_in.shape[0])
 
-        # Remove batch dimension for torchdiffeq
-        return derivative.squeeze(0)
+                def diff2flow_apply_model(x_in, sigma_in, **c):
+                    return base_model.get_diff2flow_velocity(fm_x=x_in, fm_t=t_in, **c)
+
+                base_model.apply_model = diff2flow_apply_model
+                
+                dm_t_continuous = base_model._df_convert_fm_t_to_dm_t(t_in)
+                current_sigma_for_conds = base_model.model_sampling.sigma(dm_t_continuous)
+
+                velocity_cond, velocity_uncond = comfy.samplers.calc_cond_batch(base_model, [positive_conds, negative_conds], y_in, current_sigma_for_conds, model_options)
+                
+                velocity = velocity_uncond + cond_scale * (velocity_cond - velocity_uncond)
+                self.last_denoised = y_in 
+                return velocity.squeeze(0)
+            finally:
+                base_model.apply_model = original_apply_model
+        else:
+            if t <= 1e-5: 
+                return torch.zeros_like(y)
+            denoised = self.model(y_in, timestep_in, **self.extra_args)
+            self.last_denoised = denoised
+            # Calculate derivative
+            derivative = (y_in - denoised) / t
+            # Remove batch dimension for torchdiffeq
+            return derivative.squeeze(0)
 
     def _callback(self, t0, y0, step):
         if self.callback is not None:
+            sigma_for_callback = t0
             denoised_for_preview = self.last_denoised if self.last_denoised is not None else y0.unsqueeze(0)
+            
+            if self.is_diff2flow:
+                base_model = self.model.inner_model
+                dm_t = base_model._df_convert_fm_t_to_dm_t(t0)
+                sigma_for_callback = base_model.model_sampling.sigma(dm_t)
+                denoised_for_preview = y0.unsqueeze(0)
+
             self.callback({
                 "x": y0.unsqueeze(0),
                 "i": step,
-                "sigma": t0,
-                "sigma_hat": t0,
+                "sigma": sigma_for_callback,
+                "sigma_hat": sigma_for_callback,
                 "denoised": denoised_for_preview
             })
 
@@ -278,24 +319,40 @@ class ODESampler:
 
     @torch.no_grad()
     def __call__(self, model, x, sigmas, extra_args=None, callback=None, disable=None):
-        is_adaptive = self.solver in self.ADAPTIVE_SOLVERS
-        t_max = sigmas[0] # Use the provided sigma schedule
-        t_min = sigmas[-1]
-        t = torch.stack([t_max, t_min]) if is_adaptive else sigmas.to(x.device)
-
-        # The model passed here from KSampler is a wrapper, we need the inner CFGGuider
         cfg_guider_model = model.inner_model
+        is_diff2flow = hasattr(cfg_guider_model.inner_model, 'get_diff2flow_velocity')
+        is_adaptive = self.solver in self.ADAPTIVE_SOLVERS
+
+        if is_diff2flow:
+            # Un-scale the initial noise.
+            # Flow Matching's ODE must start from unscaled N(0,I) noise, but KSampler prepares x as scaled noise.
+            initial_sigma = sigmas[0]
+            if initial_sigma > 0:
+                x = x / initial_sigma
+
+            t_start = torch.tensor(0.0, device=x.device)
+            t_end = torch.tensor(1.0, device=x.device)
+
+            if is_adaptive:
+                t = torch.stack([t_start, t_end])
+            else:
+                t = torch.linspace(t_start.item(), t_end.item(), len(sigmas), device=x.device)
+        else:
+            t_max = sigmas[0]
+            t_min = sigmas[-1]
+            t = torch.stack([t_max, t_min]) if is_adaptive else sigmas.to(x.device)
 
         # The ODE function needs a model that returns denoised x0. The CFG guider does exactly that.
         # We must clean up extra_args to remove arguments not expected by the CFGGuider's predict function.
         ode_extra_args = extra_args.copy()
         ode_extra_args.pop('denoise_mask', None)
-        ode = ODEFunction(cfg_guider_model, t_min, t_max, len(sigmas), is_adaptive, ode_extra_args, callback)
+        ode = ODEFunction(cfg_guider_model, t.min(), t.max(), len(sigmas), is_adaptive, ode_extra_args, callback)
 
         samples = torch.empty_like(x)
         for i in trange(x.shape[0], desc=self.solver, disable=disable):
             ode.reset()
             samples[i] = torchdiffeq.odeint(ode, x[i], t, rtol=self.rtol, atol=self.atol, method=self.solver, options={"max_num_steps": self.max_steps})[-1]
+
         return samples
 
 # Node Definition
@@ -339,14 +396,14 @@ class Diff2FlowODESampler:
     FUNCTION = "sample"
     CATEGORY = "sampling/custom_sampling"
 
-    def sample(self, model, solver, steps, cfg, denoise, seed, positive, negative, latent_image, disable_pbar=False, **kwargs):
+    def sample(self, model, solver, steps, cfg, denoise, seed, positive, negative, latent_image, scheduler, disable_pbar=False, **kwargs):
+        if torchdiffeq is None:
+            raise ImportError("torchdiffeq is not installed. Please install it to use this solver.")
+
         # Clone model and enable Diff2Flow
         model_patched = model.clone()
         enable_diff2flow(model_patched.model)
 
-        # Determine which sampler to use
-        if torchdiffeq is None:
-            raise ImportError("torchdiffeq is not installed. Please install it to use this solver.")
         log_relative_tolerance = kwargs.get("log_relative_tolerance", -2.5)
         log_absolute_tolerance = kwargs.get("log_absolute_tolerance", -3.5)
         max_steps_ode = kwargs.get("max_steps", 50)
@@ -360,11 +417,11 @@ class Diff2FlowODESampler:
         # Prepare sigmas based on steps and denoise value
         # This standardizes the process for all samplers
         model_sampling = model_patched.model.model_sampling
-        scheduler = kwargs.get("scheduler", "simple")
 
         if denoise == 1.0:
             sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, steps)
         else:
+            raise NotImplementedError ("denoise < 1.0 is not implemented yet")
             total_steps = int(steps / denoise) if denoise > 0 else steps
             sigmas_full = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total_steps)
             sigmas = sigmas_full[-(steps + 1):]
