@@ -2,7 +2,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2506.02221-b31b1b.svg)](https://arxiv.org/abs/2506.02221)
 
->⚠️ EXPERMENTIAL, to be improved.
+>⚠️ Experimental, to be improved.
 
 This is an unofficial implementation of the **Diff2Flow** method for ComfyUI, based on the paper:
 
