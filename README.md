@@ -51,7 +51,7 @@ When you sample, the `enable_diff2flow` function:
 1.  **Clone the Repository:**
     Navigate to your `ComfyUI/custom_nodes/` directory and clone this repo:
     ```bash
-    git clone https://github.com/Koratahiu/comfy-diff2flow
+    git clone https://github.com/Koratahiu/ComfyUI-Diff2Flow
     ```
 
 2.  **Install Dependencies:**
