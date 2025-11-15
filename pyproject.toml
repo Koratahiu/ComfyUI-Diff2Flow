@@ -1,0 +1,16 @@
+[project]
+name = "ComfyUI-Diff2Flow"
+description = "Unofficial Implementation of Diff2Flow Method for ComfyUI."
+version = "1.0.0"
+license = "LICENSE"
+dependencies = [
+  "torchdiffeq"
+]
+
+[project.urls]
+Repository = "https://github.com/Koratahiu/ComfyUI-Diff2Flow"
+
+[tool.comfy]
+PublisherId = "Koratahiu"
+DisplayName = "ComfyUI-Diff2Flow"
+Icon = ""
