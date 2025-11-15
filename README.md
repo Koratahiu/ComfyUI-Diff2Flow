@@ -29,7 +29,7 @@ This allows a model to be sampled using a flow-matching objective, which can lea
 
 This implementation provides a single node, `Diff2Flow ODE KSampler`.
 
-Instead of requiring a special model finetuned with the Diff2Flow objective, this node **patches your existing diffusion model** (e.g., SD1.5, SD2.1, SDXL) at runtime.
+This node **patches your diffusion model** (e.g., SD1.5, SD2.1, SDXL) at runtime, enabling diff2flow.
 
 When you sample, the `enable_diff2flow` function:
 1.  **Patches** your loaded model by adding the `Diff2Flow` mathematical conversions based on the model's original `beta_schedule`.
@@ -42,7 +42,7 @@ When you sample, the `enable_diff2flow` function:
 
 ## 🚀 Key Features
 
-* **Works with Standard Checkpoints:** Use your existing `v-prediction` (like SD 2.1)  and `epsilon-prediction` (like SDXL)  models.
+* **Works with Standard Checkpoints or Finetuned Diff2Flow Models:** Use your existing `v-prediction` (like SD 2.1)  and `epsilon-prediction` (like SDXL) models. Or the models you finetuned using Diff2FLow.
 * **True ODE Solvers:** Integrates with `torchdiffeq` to provide a wide range of solvers, including adaptive-step-size solvers (`dopri5`, `bosh3`, etc.) and fixed-step-size solvers (`euler`, `rk4`, `midpoint`, etc.).
 * **Single Node:** A simple, drop-in KSampler alternative.
 
