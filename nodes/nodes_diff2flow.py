@@ -18,6 +18,32 @@ from comfy.ldm.modules.diffusionmodules.util import make_beta_schedule
 from tqdm.auto import trange, tqdm
 import latent_preview
 
+# Ensure ZSNR schedule matching
+def enforce_zero_terminal_snr(betas):
+    # Convert betas to alphas_bar_sqrt
+    if isinstance(betas, np.ndarray):
+        betas = torch.tensor(betas, dtype=torch.float64)
+    alphas = 1 - betas
+    alphas_bar = alphas.cumprod(0)
+    alphas_bar_sqrt = alphas_bar.sqrt()
+
+    # Store old values.
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    
+    # Shift so last timestep is zero.
+    alphas_bar_sqrt -= alphas_bar_sqrt_T
+    
+    # Scale so first timestep is back to old value.
+    alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+
+    # Convert alphas_bar_sqrt to betas
+    alphas_bar = alphas_bar_sqrt ** 2
+    alphas = alphas_bar[1:] / alphas_bar[:-1]
+    alphas = torch.cat([alphas_bar[0:1], alphas])
+    betas = 1 - alphas
+    return betas.numpy()
+
 # Diff2Flow Core Logic
 
 def _d2f_extract_into_tensor(self, a: torch.Tensor, t: torch.Tensor, x_shape: tuple[int, ...]) -> torch.Tensor:
@@ -147,7 +173,7 @@ def _d2f_get_diff2flow_velocity(self, fm_x: torch.Tensor, fm_t: torch.Tensor, **
 
 def enable_diff2flow(model):
     """
-    Modifies the model in-place to enable training and inference
+    Modifies the model in-place to enable inference
     with the Diff2Flow methodology.
     The logic based on the paper:
     "Diff2Flow: Training Flow Matching Models via Diffusion Model Alignment"
@@ -166,12 +192,19 @@ def enable_diff2flow(model):
     if beta_schedule_name == "scaled_linear":
         beta_schedule_name = "linear"
 
+    # Respect ZSNR if the model uses it
+    zsnr = getattr(model.model_sampling, 'zsnr', False)
+
     betas_tensor = make_beta_schedule(
         beta_schedule_name,
         model.model_sampling.num_timesteps,
         linear_start=model.model_sampling.linear_start,
         linear_end=model.model_sampling.linear_end
     )
+    
+    if zsnr:
+        betas_tensor = torch.from_numpy(enforce_zero_terminal_snr(betas_tensor.numpy())).to(betas_tensor.dtype)
+
     betas = betas_tensor.cpu().numpy()
 
     alphas = 1. - betas
@@ -199,6 +232,8 @@ def enable_diff2flow(model):
     rectified_sqrt_alphas = model.df_sqrt_one_minus_alphas_cumprod_full / (model.df_sqrt_alphas_cumprod_full + model.df_sqrt_one_minus_alphas_cumprod_full)
 
     model.register_buffer('df_rectified_alphas_cumprod_full', rectified_alphas)
+    
+    # Attach all helper methods to the model object
     model._df_extract_into_tensor = MethodType(_d2f_extract_into_tensor, model)
     model._df_convert_fm_t_to_dm_t = MethodType(_d2f_convert_fm_t_to_dm_t, model)
     model._df_convert_fm_xt_to_dm_xt = MethodType(_d2f_convert_fm_xt_to_dm_xt, model)
@@ -259,7 +294,7 @@ class ODEFunction:
                 return velocity.squeeze(0)
             finally:
                 base_model.apply_model = original_apply_model
-        else:
+        else: # Fallback for standard ODE models (not used by this node)
             if t <= 1e-5: 
                 return torch.zeros_like(y)
             denoised = self.model(y_in, timestep_in, **self.extra_args)
@@ -346,7 +381,7 @@ class ODESampler:
         # We must clean up extra_args to remove arguments not expected by the CFGGuider's predict function.
         ode_extra_args = extra_args.copy()
         ode_extra_args.pop('denoise_mask', None)
-        ode = ODEFunction(cfg_guider_model, t.min(), t.max(), len(sigmas), is_adaptive, ode_extra_args, callback)
+        ode = ODEFunction(cfg_guider_model, t.min(), t.max(), len(sigmas) - 1, is_adaptive, ode_extra_args, callback)
 
         samples = torch.empty_like(x)
         for i in trange(x.shape[0], desc=self.solver, disable=disable):
@@ -365,7 +400,7 @@ class Diff2FlowODESampler:
         ALL_ODE_SOLVERS = sorted(list(ADAPTIVE_SOLVERS | FIXED_SOLVERS))
         SOLVERS = ALL_ODE_SOLVERS
     else:
-        raise ImportError("torchdiffeq is not installed. Please install it to use this node.")
+        SOLVERS = ["torchdiffeq not installed"]
 
     @classmethod
     def INPUT_TYPES(s):
@@ -388,7 +423,7 @@ class Diff2FlowODESampler:
             inputs["optional"] = {
                 "log_relative_tolerance": ("FLOAT", { "min": -7, "max": 0, "default": -2.5, "step": 0.1 }),
                 "log_absolute_tolerance": ("FLOAT", { "min": -7, "max": 0, "default": -3.5, "step": 0.1 }),
-                "max_steps": ("INT", { "min": 1, "max": 500, "default": 50, "step": 1 }),
+                "max_steps": ("INT", { "min": 1, "max": 1000, "default": 100, "step": 1 }),
             }
         return inputs
 
@@ -406,7 +441,7 @@ class Diff2FlowODESampler:
 
         log_relative_tolerance = kwargs.get("log_relative_tolerance", -2.5)
         log_absolute_tolerance = kwargs.get("log_absolute_tolerance", -3.5)
-        max_steps_ode = kwargs.get("max_steps", 50)
+        max_steps_ode = kwargs.get("max_steps", 100)
         
         rtol = 10 ** log_relative_tolerance
         atol = 10 ** log_absolute_tolerance
